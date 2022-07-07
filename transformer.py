@@ -1,6 +1,7 @@
 from atexit import register
+from pyexpat import model
 from tokenize import Binnumber
-from turtle import forward
+from turtle import forward, position
 import torch 
 import torch.nn as nn
 import math
@@ -8,6 +9,16 @@ from torch.autograd import Variable
 import torch.nn.functional as F
 import copy
 
+# Embedding 
+class Embeddings(nn.Module):
+    def __init__(self, d_model, vocab):
+        super(Embeddings, self).__init__()
+        self.lut = nn.Embedding(vocab, d_model)
+        self.d_model = d_model
+
+
+    def forward(self, x):
+        return self.lut(x) * math.sqrt(self.d_model)
 
 # Positional Encoder
 class PositionalEncoding(nn.Module):
@@ -170,3 +181,159 @@ class Encoder(nn.Module):
 # # print(en_result.shape)
 
 
+# ------------------------------------- Decoder
+
+# Decoder Layer
+
+class DecoderLayer(nn.Module):
+    def __init__(self, size, self_attn, src_attn, feed_forward, dropout) -> None:
+        super(DecoderLayer, self).__init__()
+        # size: embedding dim
+        # self_attn: object of Multiple-head attention
+        # src_attn: object of normal attention
+        # feed_forward: object of feed forward connection
+        # dropout: dropout
+
+        self.size = size
+        self.self_attn = self_attn
+        self.src_attn = src_attn
+        self.feed_forward = feed_forward
+        # clone 3 connection
+        self.sublayer = clones(SublayerConnection(size, dropout), 3)
+    
+    def forward(self, x, memory, source_mask, target_mask):
+        # x: output of last layer
+        # memory: Semantic storage variables from the encoder layer
+        # source_mask: source data mask
+        # target_mask: target data mask
+
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, target_mask))
+        x = self.sublayer[1](x, lambda x: self.src_attn(x, memory, memory, source_mask))
+
+        return self.sublayer[2](x, self.feed_forward)
+    
+class Decoder(nn.Module):
+    def __init__(self, layer, N) -> None:
+        super(Decoder, self).__init__()
+        # N: clone N decoder layers
+
+        self.layers = clones(layer, N)
+        self.norm = LayerNorm(layer.size)
+    
+    def forward(self, x, memory, source_mask, target_mask):
+        # x: output of last layer
+        # memory: Semantic storage variables from the encoder layer
+        # source_mask: source data mask
+        # target_mask: target data mask
+
+        # loop N times
+        # norm results
+        for layer in self.layers:
+            x = layer(x, memory, source_mask, target_mask)
+        
+        return self.norm(x)
+
+# -----------------------------for test
+# # N: num layers
+# size = 512
+# d_model = 512
+# head = 8
+# d_ff = 64
+# dropout = 0.2
+# c = copy.deepcopy
+# attn = MultiHeadedAttention(head, d_model)
+# ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+# layer = DecoderLayer(d_model, c(attn), c(attn), c(ff), dropout)
+# N = 8
+# # input = encoder
+# x = pe_result
+# memory = en_result
+# mask = Variable(torch.zeros(8, 4, 4))
+# source_mask = target_mask = mask
+# de = Decoder(layer, N)
+# de_result = de(x, memory, source_mask, target_mask)
+# # print(de_result)
+# # print(de_result.shape)
+
+# Output part
+
+class Generator(nn.Module):
+    def __init__(self, d_model, vocab_size):
+        super(Generator, self).__init__()
+        self.project = nn.Linear(d_model, vocab_size)
+
+    def forward(self, x):
+        return F.log_softmax(self.project(x), dim=-1)
+
+# Encoder - Decoder
+
+class EncoderDecoder(nn.Module):
+    def __init__(self, encoder, decoder, source_emb, target_emb, generator) -> None:
+        super(EncoderDecoder, self).__init__()
+        # encoder, decoder object
+        # source and target embedding func
+        # output generator object
+        self.encoder = encoder
+        self.decoder = decoder
+        self.source_emb = source_emb
+        self.target_emb = target_emb
+        self.generator = generator
+
+    def forward(self, source, target, source_mask, targte_mask):
+        return self.generator(self.decode(self.encode(source, source_mask), source_mask,
+                                        target, targte_mask))
+
+    def encode(self, source, source_mask):
+        return self.encoder(self.source_emb(source), source_mask)
+    
+    def decode(self, memory, source_mask, target, target_mask):
+        # memory: output of encoder
+        return self.decoder(self.target_emb(target), memory, source_mask, target_mask)
+
+# Build model
+def build_model(source_vocab, target_vocab, N=6,
+                d_model=512, d_ff=2048, head=8, dropout=0.2):
+    
+    # source_vocab, target_vocab: length of vacob
+    # N: stacks number of encoder, decoder
+    # d_model: embedding dim
+    # d_ff: feed forward connection dim
+    # head: number of muti-head
+    # dropout: dropout
+
+    # rename deepcopy
+    c = copy.deepcopy
+
+    attn = MultiHeadedAttention(head, d_model)
+
+    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+
+    position = PositionalEncoding(d_model, dropout)
+
+    # Construct Model
+    model = EncoderDecoder(
+        Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
+        Decoder(DecoderLayer(d_model, c(attn), c(attn), c(ff), dropout), N),
+        nn.Sequential(Embeddings(d_model, source_vocab), c(position)),
+        nn.Sequential(Embeddings(d_model, target_vocab), c(position)),
+        Generator(d_model, target_vocab)
+    )
+
+    '''
+    Once the model structure is complete, the next step is to initialize the parameters in the model, such as the transformation matrix in the linear layer
+    Once the dimension of the judged parameter is greater than 1, it will be initialized to a matrix subject to uniform distribution.
+    '''
+    for p in model.parameters():
+        if p.dim() > 1:
+            nn.init.xavier_uniform(p)
+    
+    return model
+
+# test
+source_vocab = 11
+target_vocab = 11
+N = 6
+# use default parameters
+if __name__ == '__main__':
+    model = build_model(source_vocab, target_vocab, N)
+    print(model)
